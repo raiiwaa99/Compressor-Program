@@ -1,33 +1,15 @@
-﻿#Requires -Version 5.1
-<#
-.SYNOPSIS
-    Game Compressor — NTFS Transparent Compression Tool (WOF Native API)
-.DESCRIPTION
-    Compresses/decompresses game folders using Windows Overlay Filter (WOF)
-    via direct C# P/Invoke. Supports Xpress4K, Xpress8K, Xpress16K, LZX.
-    Skips pre-compressed file types. Protects system paths from modification.
-.AUTHOR
-    Raiiwaa_ & AI Collaborator
-.VERSION
-    3.1 — Bug fixes: read-only access rights, silent failure counting, WOF-state detection.
-#>
+#Requires -Version 5.1
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ================================================================
-#  SECTION 1 — CONFIGURATION
-# ================================================================
-
 $APP_NAME            = 'GAME COMPRESSOR'
-$APP_VERSION         = '3.1'
-$MIN_FREE_MB         = 1024   # Safety threshold: abort if free space drops below this
-$PROGRESS_REFRESH_MS = 100    # Progress bar redraw interval (ms)
-$SCAN_REPORT_EVERY   = 300    # Print scan status every N files
-$BOX_W               = 60     # Box inner width (characters)
+$APP_VERSION         = '1.0'
+$MIN_FREE_MB         = 1024
+$PROGRESS_REFRESH_MS = 100
+$SCAN_REPORT_EVERY   = 300
+$BOX_W               = 60
 
-# Extensions already compressed — skip when compressing.
-# WOF state is still checked on all files when decompressing.
 $SKIP_EXT = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]@(
         '.zip', '.rar', '.7z',  '.gz',  '.bz2', '.xz',  '.zst', '.br',  '.lz4', '.cab',
@@ -39,7 +21,6 @@ $SKIP_EXT = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
 
-# System paths that must never be modified (lowercase, no trailing backslash)
 $PROTECTED_PATHS = @(
     $env:SystemRoot
     $env:windir
@@ -49,10 +30,6 @@ $PROTECTED_PATHS = @(
     "$($env:SystemDrive)\Boot"
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     ForEach-Object { $_.TrimEnd('\').ToLower() }
-
-# ================================================================
-#  SECTION 2 — ANSI COLOUR INIT
-# ================================================================
 
 try {
     $regPath = 'HKCU:\Console'
@@ -85,27 +62,6 @@ $cR  = "$E[91m"; $cG  = "$E[92m"; $cY  = "$E[93m"; $cB  = "$E[94m"
 $cC  = "$E[96m"; $cW  = "$E[97m"; $cDG = "$E[90m"; $cBL = "$E[1m"
 $cX  = "$E[0m";  $ESC_ERASE = "$E[2K"
 
-# ================================================================
-#  SECTION 3 — NATIVE WOF ENGINE  (C# P/Invoke)
-# ================================================================
-#
-#  FIX 1 — Read-only / Access Denied
-#  ─────────────────────────────────
-#  Old code used RW_ACCESS = 0xC0000000 (GENERIC_READ | GENERIC_WRITE).
-#  GENERIC_WRITE is refused on read-only files and some locked game files.
-#
-#  WOF only needs two specific rights:
-#    FILE_READ_ATTRIBUTES  (0x00000080) — read metadata
-#    FILE_WRITE_ATTRIBUTES (0x00000100) — set/clear the WOF reparse point
-#  Combined: 0x00000180 — enough for FSCTL_SET/DELETE_EXTERNAL_BACKING,
-#  and accepted by read-only files as long as we run as Administrator.
-#
-#  FIX 2 — Silent failure / ghost 100%
-#  ─────────────────────────────────────
-#  Old code: catch { }  — exceptions swallowed, counter always incremented.
-#  New code: _failed counter tracks files that threw an exception.
-#  Caller can read NativeWof.Failed to show how many files were skipped.
-
 $wofSrc = @'
 using System;
 using System.Runtime.InteropServices;
@@ -116,11 +72,11 @@ public static class NativeWof {
 
     [StructLayout(LayoutKind.Sequential)]
     public struct WOF_FILE_COMPRESSION_INFO {
-        public uint Version;         
-        public uint Provider;        
-        public uint FileInfoVersion; 
-        public uint Algorithm;       
-        public uint Flags;           
+        public uint Version;
+        public uint Provider;
+        public uint FileInfoVersion;
+        public uint Algorithm;
+        public uint Flags;
     }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -146,18 +102,17 @@ public static class NativeWof {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
 
-    // คืนค่ากลับมาเป็นสิทธิ์เต็มเพื่อให้ส่งคำสั่ง DeviceIoControl ผ่านฉลุย
-    private const uint WOF_ACCESS     = 0xC0000000u; // GENERIC_READ | GENERIC_WRITE
+    private const uint WOF_ACCESS     = 0xC0000000u;
     private const uint SHARE_RW       = 0x00000003u;
     private const uint OPEN_EXISTING  = 3u;
-    private const uint FLAG_BACKUP    = 0x02000000u;  
-    private const uint FSCTL_SET_COMP = 0x0009030Cc;  
-    private const uint FSCTL_DEL_COMP = 0x00090310c;  
+    private const uint FLAG_BACKUP    = 0x02000000u;
+    private const uint FSCTL_SET_COMP = 0x0009030Cc;
+    private const uint FSCTL_DEL_COMP = 0x00090310c;
     private const uint INVALID_FSIZE  = 0xFFFFFFFFu;
     private static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
 
     private static int           _done;
-    private static int           _failed;   
+    private static int           _failed;
     private static volatile bool _running;
     private static volatile bool _abort;
 
@@ -175,8 +130,8 @@ public static class NativeWof {
 
     public static int QueryWofState(string path, long logicalSize) {
         long onDisk = GetCompressedSize(path);
-        if (onDisk < 0)           return -1;  
-        if (logicalSize <= 0)     return -1;  
+        if (onDisk < 0)           return -1;
+        if (logicalSize <= 0)     return -1;
         if (onDisk > 0 && onDisk < logicalSize && (logicalSize - onDisk) >= 4096)
             return 1;
         return 0;
@@ -185,8 +140,7 @@ public static class NativeWof {
     public static bool CompressFile(string path, uint algo) {
         bool isReadOnly = false;
         System.IO.FileAttributes attrs = System.IO.FileAttributes.Normal;
-        
-        // ตรวจสอบและปลดล็อกสิทธิ์ Read-Only ชั่วคราว
+
         try {
             attrs = System.IO.File.GetAttributes(path);
             if ((attrs & System.IO.FileAttributes.ReadOnly) == System.IO.FileAttributes.ReadOnly) {
@@ -208,9 +162,8 @@ public static class NativeWof {
             uint dummy;
             uint sz = (uint)Marshal.SizeOf(typeof(WOF_FILE_COMPRESSION_INFO));
             return DeviceIoControl(h, FSCTL_SET_COMP, ref info, sz, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
-        } finally { 
-            CloseHandle(h); 
-            // ทำงานเสร็จแล้ว ให้คืนค่าคุณลักษณะเดิมกลับไปให้ไฟล์เกม
+        } finally {
+            CloseHandle(h);
             if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
         }
     }
@@ -218,7 +171,7 @@ public static class NativeWof {
     public static bool DecompressFile(string path) {
         bool isReadOnly = false;
         System.IO.FileAttributes attrs = System.IO.FileAttributes.Normal;
-        
+
         try {
             attrs = System.IO.File.GetAttributes(path);
             if ((attrs & System.IO.FileAttributes.ReadOnly) == System.IO.FileAttributes.ReadOnly) {
@@ -235,15 +188,15 @@ public static class NativeWof {
         try {
             uint dummy;
             return DeviceIoControlNull(h, FSCTL_DEL_COMP, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
-        } finally { 
-            CloseHandle(h); 
+        } finally {
+            CloseHandle(h);
             if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
         }
     }
 
     private static void RunBatch(string[] paths, uint algo, int threads, bool decompress) {
         _done   = 0;
-        _failed = 0;   
+        _failed = 0;
         _abort  = false;
         Thread.MemoryBarrier();
         _running = true;
@@ -286,10 +239,6 @@ try {
 } catch {
     $script:WofError = $_.Exception.Message
 }
-
-# ================================================================
-#  SECTION 4 — UI HELPERS
-# ================================================================
 
 function Write-C {
     param([string]$Color, [string]$Text, [switch]$NoNewLine)
@@ -356,7 +305,6 @@ function Draw-Bar {
     $eta      = if ($EtaSec -ge 0)     { "ETA:$(Format-Duration $EtaSec)" }                               else { 'ETA:--' }
     $time     = if ($ElapsedSec -ge 0) { "  ${cDG}|${cX} ${cY}$(Format-Duration $ElapsedSec)${cX}" }     else { '' }
     $saved    = if ($SavedBytes -gt 512KB){ "  ${cDG}|${cX} ${cG}+$(Format-Size $SavedBytes)${cX}" }      else { '' }
-    # FIX 2: show live failure count in red so user sees issues immediately
     $failTxt  = if ($Failed -gt 0)     { "  ${cDG}|${cX} ${cR}!$("{0:N0}" -f $Failed)${cX}" }            else { '' }
     $files    = "  ${cDG}|${cX} ${cDG}$("{0:N0}" -f $Done)/$("{0:N0}" -f $Total)${cX}"
 
@@ -368,10 +316,6 @@ function Wait-Enter {
     Write-C $cDG '  Press Enter to return to menu...' -NoNewLine
     Read-Host | Out-Null
 }
-
-# ================================================================
-#  SECTION 5 — DRIVE DETECTION
-# ================================================================
 
 function Get-DriveProfile {
     param([string]$FolderPath)
@@ -442,10 +386,6 @@ function Test-HasEnoughSpace {
     return (Get-FreeBytes $DriveLetter) -gt ($MIN_FREE_MB * 1MB)
 }
 
-# ================================================================
-#  SECTION 6 — PATH VALIDATION
-# ================================================================
-
 function Read-GameFolder {
     param([string]$Prompt = 'Enter game folder path')
 
@@ -499,28 +439,6 @@ function Read-GameFolder {
     }
 }
 
-# ================================================================
-#  SECTION 7 — PRE-SCAN
-# ================================================================
-
-# FIX 3 — Reliable WOF-state detection
-# ───────────────────────────────────────
-# Old logic: onDisk -gt 0 -and onDisk -lt File.Length
-# Problem:   Incompressible files (video/audio cut-scenes that slip through the
-#            extension filter, or files Windows already tried and gave up on)
-#            have onDisk == File.Length.  The old check correctly returns $false
-#            for those — but only as long as GetCompressedFileSize is reliable.
-#            When WOF is active, Windows returns the compressed cluster count;
-#            when it is NOT active, it returns the real cluster-rounded size,
-#            which can EQUAL the logical size for small or uncompressible files.
-#
-# New logic (via NativeWof.QueryWofState):
-#   - Require the saving to be >= 4 096 B (one NTFS cluster) to be certain
-#     WOF is active — not just a cluster-rounding artefact.
-#   - State = 1  → already WOF-compressed → add to compList
-#   - State = 0  → not compressed          → add to toCompList (unless SKIP_EXT)
-#   - State = -1 → API error or zero-byte  → fall back to attribute flag
-
 function Test-IsWofCompressed {
     param([System.IO.FileInfo]$File)
     $attrCheck = ($File.Attributes -band [System.IO.FileAttributes]::Compressed) -ne 0
@@ -529,7 +447,7 @@ function Test-IsWofCompressed {
         $state = [NativeWof]::QueryWofState($File.FullName, $File.Length)
         if ($state -eq  1) { return $true }
         if ($state -eq  0) { return $false }
-        return $attrCheck   # -1 = unknown, use attribute flag as fallback
+        return $attrCheck
     } catch { return $attrCheck }
 }
 
@@ -614,10 +532,6 @@ function Invoke-Prescan {
     }
 }
 
-# ================================================================
-#  SECTION 8 — BATCH ENGINE WRAPPER
-# ================================================================
-
 function Invoke-Batch {
     param(
         [string[]] $FileList,
@@ -640,7 +554,7 @@ function Invoke-Batch {
         'Xpress4K'  { [uint32]0 }
         'Xpress16K' { [uint32]2 }
         'LZX'       { [uint32]3 }
-        default     { [uint32]1 }   # Xpress8K
+        default     { [uint32]1 }
     }
 
     $modeLabel = if ($Decompress) { "${cR}DECOMPRESS${cX}" } else { "${cG}COMPRESS${cX} [${cY}${Algorithm}${cX}]" }
@@ -671,11 +585,10 @@ function Invoke-Batch {
             }
 
             $done    = [NativeWof]::Done
-            $failed  = [NativeWof]::Failed   # FIX 2: read live failure count
+            $failed  = [NativeWof]::Failed
             $elapsed = $sw.Elapsed.TotalSeconds
             $saved   = [Math]::Max(0L, (Get-FreeBytes $DriveLetter) - $baseline)
 
-            # FIX 2: progress denominator = total queue; done+failed = processed
             $processed = $done + $failed
 
             $etaSec = -1.0
@@ -720,16 +633,12 @@ function Invoke-Batch {
 
     return @{
         Done       = $finalDone
-        Failed     = $finalFailed   # FIX 2: expose to callers
+        Failed     = $finalFailed
         ElapsedSec = $sw.Elapsed.TotalSeconds
         Aborted    = $aborted
         SavedBytes = $finalSaved
     }
 }
-
-# ================================================================
-#  SECTION 9 — COMPRESS
-# ================================================================
 
 function Start-Compress {
     param([string]$FolderPath, [hashtable]$DrvInfo)
@@ -792,7 +701,6 @@ function Start-Compress {
     $savedLine = if ($saved -gt 512KB) { "Space saved  : ${cG}$(Format-Size $saved)${cX} ($($savedPct)%)" } `
                                   else { "Space saved  : ${cDG}N/A — run Scan Only to verify${cX}" }
 
-    # FIX 2: build failure warning line for summary box
     $failLine = if ($result.Failed -gt 0) {
         "Skipped      : ${cR}$("{0:N0}" -f $result.Failed) files${cX} (read-only / locked / error)"
     } else {
@@ -812,10 +720,6 @@ function Start-Compress {
     if ($result.Aborted) { $summary += ''; $summary += "${cR}*** ABORTED — low disk space ***${cX}" }
     Draw-Box 'COMPRESSION COMPLETE' $summary
 }
-
-# ================================================================
-#  SECTION 10 — DECOMPRESS
-# ================================================================
 
 function Start-Decompress {
     param([string]$FolderPath, [hashtable]$DrvInfo)
@@ -884,10 +788,6 @@ function Start-Decompress {
     Draw-Box 'DECOMPRESSION COMPLETE' $summary
 }
 
-# ================================================================
-#  SECTION 11 — TUI BANNER & MENU
-# ================================================================
-
 function Show-Banner {
     param([hashtable]$DrvInfo = $null)
     Clear-Host
@@ -929,10 +829,6 @@ function Show-Menu {
     Write-C $cW '  >> ' -NoNewLine
 }
 
-# ================================================================
-#  SECTION 12 — ENTRY POINT
-# ================================================================
-
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -958,8 +854,6 @@ if (-not $script:WofLoaded) {
     Read-Host '  Press Enter to exit' | Out-Null
     exit 2
 }
-
-# ── Main loop ────────────────────────────────────────────────────
 
 $activeDrvInfo = $null
 
