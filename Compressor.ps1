@@ -3,7 +3,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── [จุดปรับปรุงที่ 2] ตรวจสอบสิทธิ์ Administrator ทันทีที่เริ่มสคริปต์ ──
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host ""
@@ -112,8 +111,7 @@ public static class NativeWof {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
-
-    // ── [จุดปรับปรุงที่ 1] นำเข้า Win32 API สำหรับจัดการ Attributes เพื่อรองรับ Long Path (\\?\) ──
+    
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetFileAttributesW(string lpFileName);
 
@@ -162,7 +160,6 @@ public static class NativeWof {
         uint attrs = INVALID_FILE_ATTR;
 
         try {
-            // ปรับไปใช้ GetFileAttributesW เพื่อไม่ให้พังเมื่อเจอพาธยาว \\?\
             attrs = GetFileAttributesW(path);
             if (attrs != INVALID_FILE_ATTR && (attrs & FILE_ATTRIBUTE_READONLY) == FILE_ATTRIBUTE_READONLY) {
                 isReadOnly = true;
@@ -194,7 +191,6 @@ public static class NativeWof {
         uint attrs = INVALID_FILE_ATTR;
 
         try {
-            // ปรับไปใช้ GetFileAttributesW เพื่อรองรับ Long Path เช่นกัน
             attrs = GetFileAttributesW(path);
             if (attrs != INVALID_FILE_ATTR && (attrs & FILE_ATTRIBUTE_READONLY) == FILE_ATTRIBUTE_READONLY) {
                 isReadOnly = true;
@@ -585,13 +581,12 @@ function Invoke-Batch {
         return @{ Done = 0; Failed = 0; ElapsedSec = 0.0; Aborted = $true; SavedBytes = 0L }
     }
 
-    # ── [จุดปรับปรุงที่ 3] ระบุค่า Switch Case ของ Algorithm ให้ชัดเจนตรงไปตรงมาตามหลักสากล ──
     $algoId = switch ($Algorithm) {
         'Xpress4K'  { [uint32]0 }
         'Xpress8K'  { [uint32]1 }
         'Xpress16K' { [uint32]2 }
         'LZX'       { [uint32]3 }
-        default     { [uint32]1 } # Fallback เป็น Xpress8K หากค่าหลุดมา
+        default     { [uint32]1 }
     }
 
     $modeLabel = if ($Decompress) { "${cR}DECOMPRESS${cX}" } else { "${cG}COMPRESS${cX} [${cY}${Algorithm}${cX}]" }
@@ -866,8 +861,6 @@ function Show-Menu {
     Write-C $cW '  Enter option [0-3]: ' -NoNewLine
 }
 
-# ── [จุดปรับปรุงที่ 4] เติมเต็มโค้ดโครงสร้างลูปหลัก (Main Loop) ส่วนท้ายสุดที่ขาดหายไปให้สมบูรณ์ครบถ้วน ──
-
 $activeDrvInfo = $null
 
 while ($true) {
@@ -878,7 +871,7 @@ while ($true) {
 
     if ($choice -eq '0') {
         Write-Host ''
-        Write-C $cG '  Thank you for using GAME COMPRESSOR! Exiting...'
+        Write-C $cG '  Thank you for using COMPRESSOR! Exiting...'
         Start-Sleep -Seconds 1
         break
     }
