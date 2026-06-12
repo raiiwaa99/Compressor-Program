@@ -3,8 +3,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$APP_NAME            = 'COMPRESSOR'
-$APP_VERSION         = '1.0'
+# ── [จุดปรับปรุงที่ 2] ตรวจสอบสิทธิ์ Administrator ทันทีที่เริ่มสคริปต์ ──
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host ""
+    Write-Host "  [ERROR] This script must be run as Administrator!" -ForegroundColor Red
+    Write-Host "  Please launch it via Launcher.bat or run PowerShell as Administrator." -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "  Press Enter to exit..." | Out-Null
+    Exit
+}
+
+$APP_NAME            = 'GAME COMPRESSOR'
+$APP_VERSION         = '3.2'
 $MIN_FREE_MB         = 1024
 $PROGRESS_REFRESH_MS = 100
 $SCAN_REPORT_EVERY   = 300
@@ -102,6 +113,13 @@ public static class NativeWof {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
 
+    // ── [จุดปรับปรุงที่ 1] นำเข้า Win32 API สำหรับจัดการ Attributes เพื่อรองรับ Long Path (\\?\) ──
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetFileAttributesW(string lpFileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool SetFileAttributesW(string lpFileName, uint dwFileAttributes);
+
     private const uint WOF_ACCESS     = 0xC0000000u;
     private const uint SHARE_RW       = 0x00000003u;
     private const uint OPEN_EXISTING  = 3u;
@@ -109,6 +127,8 @@ public static class NativeWof {
     private const uint FSCTL_SET_COMP = 0x0009030Cc;
     private const uint FSCTL_DEL_COMP = 0x00090310c;
     private const uint INVALID_FSIZE  = 0xFFFFFFFFu;
+    private const uint INVALID_FILE_ATTR = 0xFFFFFFFFu;
+    private const uint FILE_ATTRIBUTE_READONLY = 0x00000001u;
     private static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
 
     private static int           _done;
@@ -139,19 +159,20 @@ public static class NativeWof {
 
     public static bool CompressFile(string path, uint algo) {
         bool isReadOnly = false;
-        System.IO.FileAttributes attrs = System.IO.FileAttributes.Normal;
+        uint attrs = INVALID_FILE_ATTR;
 
         try {
-            attrs = System.IO.File.GetAttributes(path);
-            if ((attrs & System.IO.FileAttributes.ReadOnly) == System.IO.FileAttributes.ReadOnly) {
+            // ปรับไปใช้ GetFileAttributesW เพื่อไม่ให้พังเมื่อเจอพาธยาว \\?\
+            attrs = GetFileAttributesW(path);
+            if (attrs != INVALID_FILE_ATTR && (attrs & FILE_ATTRIBUTE_READONLY) == FILE_ATTRIBUTE_READONLY) {
                 isReadOnly = true;
-                System.IO.File.SetAttributes(path, attrs & ~System.IO.FileAttributes.ReadOnly);
+                SetFileAttributesW(path, attrs & ~FILE_ATTRIBUTE_READONLY);
             }
         } catch { }
 
         IntPtr h = CreateFileW(path, WOF_ACCESS, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FLAG_BACKUP, IntPtr.Zero);
         if (h == INVALID_HANDLE || h == IntPtr.Zero) {
-            if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
+            if (isReadOnly && attrs != INVALID_FILE_ATTR) { try { SetFileAttributesW(path, attrs); } catch { } }
             return false;
         }
 
@@ -164,25 +185,26 @@ public static class NativeWof {
             return DeviceIoControl(h, FSCTL_SET_COMP, ref info, sz, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
         } finally {
             CloseHandle(h);
-            if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
+            if (isReadOnly && attrs != INVALID_FILE_ATTR) { try { SetFileAttributesW(path, attrs); } catch { } }
         }
     }
 
     public static bool DecompressFile(string path) {
         bool isReadOnly = false;
-        System.IO.FileAttributes attrs = System.IO.FileAttributes.Normal;
+        uint attrs = INVALID_FILE_ATTR;
 
         try {
-            attrs = System.IO.File.GetAttributes(path);
-            if ((attrs & System.IO.FileAttributes.ReadOnly) == System.IO.FileAttributes.ReadOnly) {
+            // ปรับไปใช้ GetFileAttributesW เพื่อรองรับ Long Path เช่นกัน
+            attrs = GetFileAttributesW(path);
+            if (attrs != INVALID_FILE_ATTR && (attrs & FILE_ATTRIBUTE_READONLY) == FILE_ATTRIBUTE_READONLY) {
                 isReadOnly = true;
-                System.IO.File.SetAttributes(path, attrs & ~System.IO.FileAttributes.ReadOnly);
+                SetFileAttributesW(path, attrs & ~FILE_ATTRIBUTE_READONLY);
             }
         } catch { }
 
         IntPtr h = CreateFileW(path, WOF_ACCESS, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FLAG_BACKUP, IntPtr.Zero);
         if (h == INVALID_HANDLE || h == IntPtr.Zero) {
-            if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
+            if (isReadOnly && attrs != INVALID_FILE_ATTR) { try { SetFileAttributesW(path, attrs); } catch { } }
             return false;
         }
         try {
@@ -190,7 +212,7 @@ public static class NativeWof {
             return DeviceIoControlNull(h, FSCTL_DEL_COMP, IntPtr.Zero, 0, IntPtr.Zero, 0, out dummy, IntPtr.Zero);
         } finally {
             CloseHandle(h);
-            if (isReadOnly) { try { System.IO.File.SetAttributes(path, attrs); } catch { } }
+            if (isReadOnly && attrs != INVALID_FILE_ATTR) { try { SetFileAttributesW(path, attrs); } catch { } }
         }
     }
 
@@ -238,6 +260,19 @@ try {
     $script:WofLoaded = $true
 } catch {
     $script:WofError = $_.Exception.Message
+}
+
+if (-not $script:WofLoaded) {
+    Write-Host ""
+    Write-Host "  [CRITICAL ERROR] Failed to load WOF Engine!" -ForegroundColor Red
+    Write-Host "  This tool requires Windows 10 / 11 or Windows Server 2016+" -ForegroundColor Yellow
+    if ($null -ne $script:WofError) {
+        Write-Host "  Compiler details:"
+        $script:WofError -split "`n" | ForEach-Object { Write-Host "    $_" }
+    }
+    Write-Host ''
+    Read-Host '  Press Enter to exit' | Out-Null
+    exit 2
 }
 
 function Write-C {
@@ -550,11 +585,13 @@ function Invoke-Batch {
         return @{ Done = 0; Failed = 0; ElapsedSec = 0.0; Aborted = $true; SavedBytes = 0L }
     }
 
+    # ── [จุดปรับปรุงที่ 3] ระบุค่า Switch Case ของ Algorithm ให้ชัดเจนตรงไปตรงมาตามหลักสากล ──
     $algoId = switch ($Algorithm) {
         'Xpress4K'  { [uint32]0 }
+        'Xpress8K'  { [uint32]1 }
         'Xpress16K' { [uint32]2 }
         'LZX'       { [uint32]3 }
-        default     { [uint32]1 }
+        default     { [uint32]1 } # Fallback เป็น Xpress8K หากค่าหลุดมา
     }
 
     $modeLabel = if ($Decompress) { "${cR}DECOMPRESS${cX}" } else { "${cG}COMPRESS${cX} [${cY}${Algorithm}${cX}]" }
@@ -826,34 +863,10 @@ function Show-Menu {
     Write-Host "  ${cR} 0.${cX}  Exit"
     Write-Host "  ${cDG}$('-' * $BOX_W)${cX}"
     Write-Host ''
-    Write-C $cW '  >> ' -NoNewLine
+    Write-C $cW '  Enter option [0-3]: ' -NoNewLine
 }
 
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-
-Show-Banner
-
-if (-not $isAdmin) {
-    Write-C $cR '  [ERROR] Administrator privileges are required.'
-    Write-C $cY '  Right-click the script and choose "Run as Administrator".'
-    Write-Host ''
-    Read-Host '  Press Enter to exit' | Out-Null
-    exit 1
-}
-
-if (-not $script:WofLoaded) {
-    Write-C $cR '  [ERROR] Native WOF engine failed to compile.'
-    Write-C $cY '  Requires PowerShell 5.1+ and .NET Framework 4.0+.'
-    if ($script:WofError) {
-        Write-Host ''
-        Write-C $cDG '  Compiler details:'
-        $script:WofError -split "`n" | ForEach-Object { Write-Host "    $_" }
-    }
-    Write-Host ''
-    Read-Host '  Press Enter to exit' | Out-Null
-    exit 2
-}
+# ── [จุดปรับปรุงที่ 4] เติมเต็มโค้ดโครงสร้างลูปหลัก (Main Loop) ส่วนท้ายสุดที่ขาดหายไปให้สมบูรณ์ครบถ้วน ──
 
 $activeDrvInfo = $null
 
@@ -862,6 +875,13 @@ while ($true) {
     Show-Menu
 
     $choice = (Read-Host).Trim()
+
+    if ($choice -eq '0') {
+        Write-Host ''
+        Write-C $cG '  Thank you for using GAME COMPRESSOR! Exiting...'
+        Start-Sleep -Seconds 1
+        break
+    }
 
     if ($choice -in '1','2','3') {
         $labels = @{ '1' = 'COMPRESS'; '2' = 'DECOMPRESS'; '3' = 'SCAN' }
@@ -879,10 +899,12 @@ while ($true) {
         '3' {
                 Write-Host ''
                 $scan = Invoke-Prescan -FolderPath $folder
-                if ($null -ne $scan) { Write-Host ''; Write-C $cG '  [INFO] Scan complete — no files were modified.' }
                 Wait-Enter
-             }
-        '0' { Write-Host ''; Write-C $cC '  Goodbye!'; Write-Host ''; exit 0 }
-        default { Write-C $cR '  [ERROR] Invalid choice — enter 0, 1, 2, or 3.'; Start-Sleep 1 }
+            }
+        default {
+            Write-Host ''
+            Write-C $cR '  [WARNING] Invalid selection. Please enter 0, 1, 2, or 3.'
+            Start-Sleep -Seconds 15
+        }
     }
 }
