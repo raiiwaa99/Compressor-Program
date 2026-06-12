@@ -111,7 +111,7 @@ public static class NativeWof {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
-    
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetFileAttributesW(string lpFileName);
 
@@ -122,8 +122,8 @@ public static class NativeWof {
     private const uint SHARE_RW       = 0x00000003u;
     private const uint OPEN_EXISTING  = 3u;
     private const uint FLAG_BACKUP    = 0x02000000u;
-    private const uint FSCTL_SET_COMP = 0x0009030Cc;
-    private const uint FSCTL_DEL_COMP = 0x00090310c;
+    private const uint FSCTL_SET_COMP = 0x0009030Cu;
+    private const uint FSCTL_DEL_COMP = 0x00090310u;
     private const uint INVALID_FSIZE  = 0xFFFFFFFFu;
     private const uint INVALID_FILE_ATTR = 0xFFFFFFFFu;
     private const uint FILE_ATTRIBUTE_READONLY = 0x00000001u;
@@ -148,8 +148,8 @@ public static class NativeWof {
 
     public static int QueryWofState(string path, long logicalSize) {
         long onDisk = GetCompressedSize(path);
-        if (onDisk < 0)           return -1;
-        if (logicalSize <= 0)     return -1;
+        if (onDisk < 0)       return -1;
+        if (logicalSize <= 0) return -1;
         if (onDisk > 0 && onDisk < logicalSize && (logicalSize - onDisk) >= 4096)
             return 1;
         return 0;
@@ -333,10 +333,10 @@ function Draw-Bar {
     $filled = [int][Math]::Floor($pct / 2)
     $bar    = ([string][char]0x2588 * $filled) + ([string][char]0x2591 * (50 - $filled))
 
-    $eta      = if ($EtaSec -ge 0)     { "ETA:$(Format-Duration $EtaSec)" }                               else { 'ETA:--' }
-    $time     = if ($ElapsedSec -ge 0) { "  ${cDG}|${cX} ${cY}$(Format-Duration $ElapsedSec)${cX}" }     else { '' }
-    $saved    = if ($SavedBytes -gt 512KB){ "  ${cDG}|${cX} ${cG}+$(Format-Size $SavedBytes)${cX}" }      else { '' }
-    $failTxt  = if ($Failed -gt 0)     { "  ${cDG}|${cX} ${cR}!$("{0:N0}" -f $Failed)${cX}" }            else { '' }
+    $eta      = if ($EtaSec -ge 0)        { "ETA:$(Format-Duration $EtaSec)" }                           else { 'ETA:--' }
+    $time     = if ($ElapsedSec -ge 0)    { "  ${cDG}|${cX} ${cY}$(Format-Duration $ElapsedSec)${cX}" } else { '' }
+    $saved    = if ($SavedBytes -gt 512KB){ "  ${cDG}|${cX} ${cG}+$(Format-Size $SavedBytes)${cX}" }    else { '' }
+    $failTxt  = if ($Failed -gt 0)        { "  ${cDG}|${cX} ${cR}!$("{0:N0}" -f $Failed)${cX}" }        else { '' }
     $files    = "  ${cDG}|${cX} ${cDG}$("{0:N0}" -f $Done)/$("{0:N0}" -f $Total)${cX}"
 
     Write-Host "${ESC_ERASE}`r  ${cG}${bar}${cX} ${cBL}${cW}$($pct.ToString('F1'))%${cX}${files}${time}  ${cDG}|${cX} ${cC}${eta}${cX}${saved}${failTxt}" -NoNewline
@@ -427,7 +427,9 @@ function Read-GameFolder {
         Write-Host ''
         Write-C $cW  '  > ' -NoNewLine
 
-        $path = (Read-Host).Trim() -replace '^["\x27]|["\x27]$' | ForEach-Object { $_.Trim() }
+        $raw  = (Read-Host).Trim()
+        $path = $raw -replace '^["'']|["'']$'
+        $path = $path.Trim()
 
         if ([string]::IsNullOrWhiteSpace($path)) {
             Write-C $cR '  [ERROR] Path cannot be empty.'; continue
@@ -709,6 +711,7 @@ function Start-Compress {
 
     $needed  = [long]($scan.ToCompBytes * 0.10) + ($MIN_FREE_MB * 1MB)
     $freeNow = Get-FreeBytes $DrvInfo.DriveLetter
+
     if ($freeNow -gt 0 -and $freeNow -lt $needed) {
         Write-Host ''
         Write-C $cR '  [ERROR] Not enough free space for safe compression.'
