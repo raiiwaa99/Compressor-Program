@@ -14,8 +14,8 @@ if (-not $isAdmin) {
     Exit
 }
 
-$APP_NAME            = 'GAME COMPRESSOR'
-$APP_VERSION         = '3.2'
+$APP_NAME            = 'COMPRESSOR'
+$APP_VERSION         = '1.0'
 $MIN_FREE_MB         = 1024
 $PROGRESS_REFRESH_MS = 100
 $SCAN_REPORT_EVERY   = 300
