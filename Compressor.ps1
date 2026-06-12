@@ -3,7 +3,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$APP_NAME            = 'GAME COMPRESSOR'
+$APP_NAME            = 'COMPRESSOR'
 $APP_VERSION         = '1.0'
 $MIN_FREE_MB         = 1024
 $PROGRESS_REFRESH_MS = 100
