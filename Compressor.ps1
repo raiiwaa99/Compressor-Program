@@ -876,7 +876,7 @@ while ($true) {
         Write-Host ''
         Write-C $cG '  Thank you for using COMPRESSOR! Exiting...'
         Start-Sleep -Seconds 1
-        break
+        exit 0
     }
 
     if ($choice -in '1','2','3') {
