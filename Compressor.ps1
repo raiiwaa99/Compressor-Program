@@ -14,7 +14,7 @@ if (-not $isAdmin) {
 }
 
 $APP_NAME            = 'COMPRESSOR'
-$APP_VERSION         = '1.0'
+$APP_VERSION         = '1.1 (Optimized)'
 $MIN_FREE_MB         = 1024
 $PROGRESS_REFRESH_MS = 100
 $SCAN_REPORT_EVERY   = 300
@@ -122,7 +122,7 @@ public static class NativeWof {
     private const uint SHARE_RW       = 0x00000003u;
     private const uint OPEN_EXISTING  = 3u;
     private const uint FLAG_BACKUP    = 0x02000000u;
-    private const uint FSCTL_SET_COMP = 0x0009030Cu;
+    private const uint FSCTL_SET_COMP = 0x0009030Cc;
     private const uint FSCTL_DEL_COMP = 0x00090310u;
     private const uint INVALID_FSIZE  = 0xFFFFFFFFu;
     private const uint INVALID_FILE_ATTR = 0xFFFFFFFFu;
@@ -355,27 +355,23 @@ function Get-DriveProfile {
     $diskType = 'Unknown'
 
     try {
-        $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$letter'" -EA Stop
-        $parts   = @(Get-CimAssociatedInstance -InputObject $logDisk `
-                       -ResultClassName Win32_DiskPartition -EA Stop)
-        if ($parts.Count -gt 0) {
-            $drive = Get-CimAssociatedInstance -InputObject $parts[0] `
-                       -ResultClassName Win32_DiskDrive -EA Stop
-            $pd    = Get-CimInstance -Namespace 'root\Microsoft\Windows\Storage' `
-                       -ClassName MSFT_PhysicalDisk `
-                       -Filter "DeviceID='$($drive.Index)'" -EA SilentlyContinue
-
-            $diskType = if ($pd) {
-                switch ($pd.MediaType) {
-                    4       { 'SSD' }
-                    3       { 'HDD' }
+        # ได้รับการอัปเดตให้ดึงข้อมูลผ่าน Storage Module โดยตรง ซึ่งเร็วกว่าและแม่นยำกว่า CIM Legacy
+        $disk = Get-Partition -DriveLetter $letter[0] | Get-Disk -EA Stop
+        if ($disk) {
+            $pd = Get-PhysicalDisk -DeviceID $disk.Number -EA SilentlyContinue
+            if ($pd) {
+                $diskType = switch ($pd.MediaType) {
+                    'SSD'   { 'SSD' }
+                    'HDD'   { 'HDD' }
                     default { if ($pd.FriendlyName -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' } }
                 }
             } else {
-                if ($drive.Model -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' }
+                if ($disk.Model -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' }
             }
         }
-    } catch {}
+    } catch {
+        $diskType = 'Unknown'
+    }
 
     $cpu     = [Math]::Max([Environment]::ProcessorCount, 1)
     $threads = switch ($diskType) {
@@ -497,45 +493,76 @@ function Invoke-Prescan {
     $toCompList = [System.Collections.Generic.List[string]]::new(8192)
     $compList   = [System.Collections.Generic.List[string]]::new(4096)
 
-    $enumPath = if ($FolderPath.StartsWith('\\?\')) { $FolderPath } else { "\\?\$FolderPath" }
-    $sw       = [System.Diagnostics.Stopwatch]::StartNew()
-
-    try {
-        $enumerator = [System.IO.Directory]::EnumerateFiles(
-            $enumPath, '*', [System.IO.SearchOption]::AllDirectories)
-    } catch {
-        try {
-            $enumerator = [System.IO.Directory]::EnumerateFiles(
-                $FolderPath, '*', [System.IO.SearchOption]::AllDirectories)
-        } catch {
-            Write-Host ''
-            Write-C $cR "  [ERROR] Cannot read folder: $($_.Exception.Message)"
-            return $null
-        }
+    # ปรับพาร์ทให้ปลอดภัยต่อ Long Path และ UNC Network Share
+    $enumPath = $FolderPath
+    if (-not $enumPath.StartsWith('\\')) {
+        $enumPath = "\\?\$enumPath"
+    } elseif ($enumPath.StartsWith('\\') -and -not $enumPath.StartsWith('\\?\')) {
+        $enumPath = "\\?\UNC\" + $enumPath.TrimStart('\')
     }
 
-    foreach ($fp in $enumerator) {
-        $totalFiles++
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-        if ($totalFiles % $SCAN_REPORT_EVERY -eq 0) {
-            $rate    = if ($sw.Elapsed.TotalSeconds -gt 0.5) { [int]($totalFiles / $sw.Elapsed.TotalSeconds) } else { 0 }
-            $elapsed = Format-Duration $sw.Elapsed.TotalSeconds
-            Write-Host "${ESC_ERASE}`r  ${cDG}Scanning:${cX} ${cW}$("{0:N0}" -f $totalFiles)${cX} files  ${cDG}|${cX} ${cC}${rate}/s${cX}  ${cDG}|${cX} ${cY}${elapsed}${cX}   " -NoNewline
+    # ใช้ระบบ Queue-based Recursive Scan เพื่อหลีกเลี่ยงการสแกนล่มเมื่อเจอโฟลเดอร์ Access Denied
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue($enumPath)
+
+    while ($queue.Count -gt 0) {
+        $currentDir = $queue.Dequeue()
+
+        # อ่านไฟล์ในโฟลเดอร์ปัจจุบันอย่างปลอดภัย
+        try {
+            $files = [System.IO.Directory]::EnumerateFiles($currentDir)
+            foreach ($fp in $files) {
+                $totalFiles++
+
+                if ($totalFiles % $SCAN_REPORT_EVERY -eq 0) {
+                    $rate    = if ($sw.Elapsed.TotalSeconds -gt 0.5) { [int]($totalFiles / $sw.Elapsed.TotalSeconds) } else { 0 }
+                    $elapsed = Format-Duration $sw.Elapsed.TotalSeconds
+                    Write-Host "${ESC_ERASE}`r  ${cDG}Scanning:${cX} ${cW}$("{0:N0}" -f $totalFiles)${cX} files  ${cDG}|${cX} ${cC}${rate}/s${cX}  ${cDG}|${cX} ${cY}${elapsed}${cX}   " -NoNewline
+                }
+
+                try {
+                    $attrs = [System.IO.File]::GetAttributes($fp)
+                    $fi = [System.IO.FileInfo]::new($fp)
+                    $length = $fi.Length
+                    $totalBytes += $length
+
+                    $isWof = $false
+                    if (($attrs -band [System.IO.FileAttributes]::Compressed) -ne 0) {
+                        $isWof = $true
+                    } elseif ($script:WofLoaded) {
+                        $state = [NativeWof]::QueryWofState($fp, $length)
+                        if ($state -eq 1) { $isWof = $true }
+                    }
+
+                    if ($isWof) {
+                        $alreadyComp++
+                        $compList.Add($fp)
+                    } else {
+                        $ext = [System.IO.Path]::GetExtension($fp)
+                        if ($SKIP_EXT.Contains($ext)) {
+                            $skipFiles++
+                        } else {
+                            $toCompFiles++
+                            $toCompBytes += $length
+                            $toCompList.Add($fp)
+                        }
+                    }
+                } catch { continue }
+            }
+        } catch {
+            # ข้ามไปอย่างปลอดภัยหากโฟลเดอร์หรือไฟล์นั้นถูกล็อกหรือไม่มีสิทธิ์อ่านข้อมูล
         }
 
-        $fi = $null
-        try { $fi = [System.IO.FileInfo]::new($fp) } catch { continue }
-        $totalBytes += $fi.Length
-
-        if (Test-IsWofCompressed $fi) {
-            $alreadyComp++
-            $compList.Add($fp)
-        } elseif ($SKIP_EXT.Contains([System.IO.Path]::GetExtension($fp))) {
-            $skipFiles++
-        } else {
-            $toCompFiles++
-            $toCompBytes += $fi.Length
-            $toCompList.Add($fp)
+        # เติมโฟลเดอร์ย่อยเข้าไปในคิวเพื่อทำการสแกนต่อ
+        try {
+            $subDirs = [System.IO.Directory]::EnumerateDirectories($currentDir)
+            foreach ($sd in $subDirs) {
+                $queue.Enqueue($sd)
+            }
+        } catch {
+            # ข้ามโฟลเดอร์ย่อยที่เข้าถึงไม่ได้
         }
     }
 
@@ -900,7 +927,7 @@ while ($true) {
         default {
             Write-Host ''
             Write-C $cR '  [WARNING] Invalid selection. Please enter 0, 1, 2, or 3.'
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 2
         }
     }
 }
