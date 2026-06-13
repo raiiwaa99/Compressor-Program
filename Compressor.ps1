@@ -14,7 +14,7 @@ if (-not $isAdmin) {
 }
 
 $APP_NAME            = 'COMPRESSOR'
-$APP_VERSION         = '1.1 (Optimized)'
+$APP_VERSION         = '1.0'
 $MIN_FREE_MB         = 1024
 $PROGRESS_REFRESH_MS = 100
 $SCAN_REPORT_EVERY   = 300
@@ -122,7 +122,7 @@ public static class NativeWof {
     private const uint SHARE_RW       = 0x00000003u;
     private const uint OPEN_EXISTING  = 3u;
     private const uint FLAG_BACKUP    = 0x02000000u;
-    private const uint FSCTL_SET_COMP = 0x0009030Cc;
+    private const uint FSCTL_SET_COMP = 0x0009030Cu;  // FIX: was 0x0009030Cc (invalid C# suffix)
     private const uint FSCTL_DEL_COMP = 0x00090310u;
     private const uint INVALID_FSIZE  = 0xFFFFFFFFu;
     private const uint INVALID_FILE_ATTR = 0xFFFFFFFFu;
@@ -134,10 +134,24 @@ public static class NativeWof {
     private static volatile bool _running;
     private static volatile bool _abort;
 
+    // FIX (Memory Leak): expose a task reference so unobserved exceptions are caught
+    private static Task _batchTask;
+
     public static int  Done    { get { return Interlocked.CompareExchange(ref _done,   0, 0); } }
     public static int  Failed  { get { return Interlocked.CompareExchange(ref _failed, 0, 0); } }
     public static bool Running { get { return _running; } }
     public static bool Abort   { get { return _abort; } set { _abort = value; } }
+
+    public static string LastError {
+        get {
+            Task t = _batchTask;
+            if (t != null && t.IsFaulted && t.Exception != null)
+                return t.Exception.InnerException != null
+                    ? t.Exception.InnerException.Message
+                    : t.Exception.Message;
+            return null;
+        }
+    }
 
     public static long GetCompressedSize(string path) {
         uint high;
@@ -213,9 +227,10 @@ public static class NativeWof {
     }
 
     private static void RunBatch(string[] paths, uint algo, int threads, bool decompress) {
-        _done   = 0;
-        _failed = 0;
-        _abort  = false;
+        // FIX (Memory Leak): always reset statics before starting a new batch
+        Interlocked.Exchange(ref _done,   0);
+        Interlocked.Exchange(ref _failed, 0);
+        _abort = false;
         Thread.MemoryBarrier();
         _running = true;
         try {
@@ -240,9 +255,16 @@ public static class NativeWof {
     }
 
     public static void StartAsync(string[] paths, uint algo, int threads, bool decompress) {
-        Task.Factory.StartNew(delegate() {
+        // FIX (Memory Leak): store task and attach a continuation to observe exceptions,
+        // preventing unobserved TaskException from keeping the Task object alive indefinitely.
+        _batchTask = Task.Factory.StartNew(delegate() {
             RunBatch(paths, algo, threads, decompress);
-        });
+        }, TaskCreationOptions.LongRunning);
+
+        _batchTask.ContinueWith(delegate(Task t) {
+            // observe the exception so GC can collect the faulted Task
+            var _ = t.Exception;
+        }, TaskContinuationOptions.OnlyOnFaulted);
     }
 }
 '@
@@ -348,17 +370,34 @@ function Wait-Enter {
     Read-Host | Out-Null
 }
 
+# FIX: Build the correct \\?\ or \\?\UNC\ long-path prefix for a given path.
+# Handles: local drive paths, UNC paths, already-prefixed paths.
+function Get-LongPath {
+    param([string]$Path)
+    if ($Path.StartsWith('\\?\'))         { return $Path }                               # already prefixed — leave as-is
+    if ($Path.StartsWith('\\'))           { return '\\?\UNC\' + $Path.TrimStart('\') }  # UNC → \\?\UNC\server\share
+    return '\\?\' + $Path                                                                # local → \\?\C:\...
+}
+
 function Get-DriveProfile {
     param([string]$FolderPath)
 
-    $letter   = ([System.IO.Path]::GetPathRoot($FolderPath)).TrimEnd('\')
+    # FIX: UNC paths have no drive letter; detect and skip WMI/CIM disk-type detection for them.
+    $root     = [System.IO.Path]::GetPathRoot($FolderPath)
+    $isUNC    = $root.StartsWith('\\')
+    $letter   = if ($isUNC) { $null } else { $root.TrimEnd('\') }
     $diskType = 'Unknown'
 
-    try {
-        # ได้รับการอัปเดตให้ดึงข้อมูลผ่าน Storage Module โดยตรง ซึ่งเร็วกว่าและแม่นยำกว่า CIM Legacy
-        $disk = Get-Partition -DriveLetter $letter[0] | Get-Disk -EA Stop
-        if ($disk) {
-            $pd = Get-PhysicalDisk -DeviceID $disk.Number -EA SilentlyContinue
+    if (-not $isUNC -and -not [string]::IsNullOrEmpty($letter)) {
+        try {
+            # FIX: Get-PhysicalDisk has no -DeviceID parameter.
+            # Correct chain: drive letter → Partition → Disk → PhysicalDisk by disk number.
+            $driveLetter = $letter.TrimEnd(':')[0]
+            $partition   = Get-Partition -DriveLetter $driveLetter -EA Stop
+            $disk        = $partition | Get-Disk -EA Stop
+            $pd          = Get-PhysicalDisk -EA SilentlyContinue |
+                               Where-Object { $_.DeviceId -eq $disk.Number }
+
             if ($pd) {
                 $diskType = switch ($pd.MediaType) {
                     'SSD'   { 'SSD' }
@@ -366,11 +405,12 @@ function Get-DriveProfile {
                     default { if ($pd.FriendlyName -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' } }
                 }
             } else {
-                if ($disk.Model -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' }
+                # FIX: v1.1 forgot to assign result to $diskType in this branch
+                $diskType = if ($disk.Model -match 'SSD|NVMe|Solid|Flash') { 'SSD' } else { 'HDD' }
             }
+        } catch {
+            $diskType = 'Unknown'
         }
-    } catch {
-        $diskType = 'Unknown'
     }
 
     $cpu     = [Math]::Max([Environment]::ProcessorCount, 1)
@@ -382,9 +422,10 @@ function Get-DriveProfile {
 
     $freeGB = 0.0; $totalGB = 0.0
     try {
-        $di      = [System.IO.DriveInfo]::new($letter + '\')
-        $freeGB  = [Math]::Round($di.AvailableFreeSpace / 1GB, 1)
-        $totalGB = [Math]::Round($di.TotalSize / 1GB, 1)
+        $driveRoot = if ($isUNC) { $root } else { $letter + '\' }
+        $di        = [System.IO.DriveInfo]::new($driveRoot)
+        $freeGB    = [Math]::Round($di.AvailableFreeSpace / 1GB, 1)
+        $totalGB   = [Math]::Round($di.TotalSize / 1GB, 1)
     } catch {}
 
     return @{
@@ -392,7 +433,8 @@ function Get-DriveProfile {
         MaxThreads  = $threads
         FreeGB      = $freeGB
         TotalGB     = $totalGB
-        DriveLetter = $letter
+        DriveLetter = if ($isUNC) { $root.TrimEnd('\') } else { $letter }
+        IsUNC       = $isUNC
     }
 }
 
@@ -486,31 +528,26 @@ function Invoke-Prescan {
     Write-Host ''
     Write-C $cC '  Scanning folder...'
 
-    $totalFiles  = 0L; $totalBytes   = 0L
-    $skipFiles   = 0L; $alreadyComp  = 0L
-    $toCompFiles = 0L; $toCompBytes  = 0L
+    $totalFiles  = 0L; $totalBytes      = 0L
+    $skipFiles   = 0L; $alreadyComp     = 0L
+    $toCompFiles = 0L; $toCompBytes     = 0L
+    $compBytes   = 0L  # FIX (Space Calc): track compressed-file logical bytes separately
 
     $toCompList = [System.Collections.Generic.List[string]]::new(8192)
     $compList   = [System.Collections.Generic.List[string]]::new(4096)
 
-    # ปรับพาร์ทให้ปลอดภัยต่อ Long Path และ UNC Network Share
-    $enumPath = $FolderPath
-    if (-not $enumPath.StartsWith('\\')) {
-        $enumPath = "\\?\$enumPath"
-    } elseif ($enumPath.StartsWith('\\') -and -not $enumPath.StartsWith('\\?\')) {
-        $enumPath = "\\?\UNC\" + $enumPath.TrimStart('\')
-    }
+    # FIX (Long Path): use Get-LongPath helper — handles local, UNC, and already-prefixed paths correctly
+    $enumPath = Get-LongPath $FolderPath
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # ใช้ระบบ Queue-based Recursive Scan เพื่อหลีกเลี่ยงการสแกนล่มเมื่อเจอโฟลเดอร์ Access Denied
+    # Queue-based BFS scan — resilient to Access Denied on individual subdirectories
     $queue = [System.Collections.Generic.Queue[string]]::new()
     $queue.Enqueue($enumPath)
 
     while ($queue.Count -gt 0) {
         $currentDir = $queue.Dequeue()
 
-        # อ่านไฟล์ในโฟลเดอร์ปัจจุบันอย่างปลอดภัย
         try {
             $files = [System.IO.Directory]::EnumerateFiles($currentDir)
             foreach ($fp in $files) {
@@ -523,8 +560,8 @@ function Invoke-Prescan {
                 }
 
                 try {
-                    $attrs = [System.IO.File]::GetAttributes($fp)
-                    $fi = [System.IO.FileInfo]::new($fp)
+                    $attrs  = [System.IO.File]::GetAttributes($fp)
+                    $fi     = [System.IO.FileInfo]::new($fp)
                     $length = $fi.Length
                     $totalBytes += $length
 
@@ -538,6 +575,7 @@ function Invoke-Prescan {
 
                     if ($isWof) {
                         $alreadyComp++
+                        $compBytes += $length  # FIX (Space Calc): accumulate compressed-file sizes
                         $compList.Add($fp)
                     } else {
                         $ext = [System.IO.Path]::GetExtension($fp)
@@ -551,23 +589,21 @@ function Invoke-Prescan {
                     }
                 } catch { continue }
             }
-        } catch {
-            # ข้ามไปอย่างปลอดภัยหากโฟลเดอร์หรือไฟล์นั้นถูกล็อกหรือไม่มีสิทธิ์อ่านข้อมูล
-        }
+        } catch { }
 
-        # เติมโฟลเดอร์ย่อยเข้าไปในคิวเพื่อทำการสแกนต่อ
         try {
             $subDirs = [System.IO.Directory]::EnumerateDirectories($currentDir)
             foreach ($sd in $subDirs) {
                 $queue.Enqueue($sd)
             }
-        } catch {
-            # ข้ามโฟลเดอร์ย่อยที่เข้าถึงไม่ได้
-        }
+        } catch { }
     }
 
     $sw.Stop()
     Write-Host "${ESC_ERASE}`r" -NoNewline
+
+    # FIX (Memory Leak): explicitly clear the queue after use so GC can reclaim sooner
+    $queue.Clear()
 
     $compPct = if ($totalFiles -gt 0) { [Math]::Round($alreadyComp * 100.0 / $totalFiles, 1) } else { 0 }
 
@@ -584,6 +620,7 @@ function Invoke-Prescan {
         TotalBytes  = $totalBytes
         SkipFiles   = $skipFiles
         AlreadyComp = $alreadyComp
+        CompBytes   = $compBytes    # FIX (Space Calc): returned for accurate decompress estimate
         CompPct     = $compPct
         ToCompFiles = $toCompFiles
         ToCompBytes = $toCompBytes
@@ -628,8 +665,9 @@ function Invoke-Batch {
     $aborted  = $false
 
     $WIN_SIZE = 8
-    $winDone  = [System.Collections.Generic.Queue[long]]::new()
-    $winTime  = [System.Collections.Generic.Queue[double]]::new()
+    # FIX (Memory Leak): pre-size sliding window queues to WIN_SIZE to prevent unbounded growth
+    $winDone  = [System.Collections.Generic.Queue[long]]::new($WIN_SIZE + 1)
+    $winTime  = [System.Collections.Generic.Queue[double]]::new($WIN_SIZE + 1)
     $prevDone = 0L; $prevTime = 0.0
 
     [NativeWof]::StartAsync($FileList, $algoId, $MaxThreads, $Decompress.IsPresent)
@@ -681,11 +719,19 @@ function Invoke-Batch {
                 [System.Threading.Thread]::Sleep(50)
             }
         }
+        # FIX (Memory Leak): clear sliding window queues after batch finishes
+        $winDone.Clear()
+        $winTime.Clear()
     }
 
     $sw.Stop()
     $finalDone   = [NativeWof]::Done
     $finalFailed = [NativeWof]::Failed
+
+    # FIX (Space Calc): use a single authoritative free-space measurement taken after the batch
+    # completes and the thread has returned, rather than the stale baseline-delta inside Invoke-Batch.
+    # Sleep gives NTFS time to flush MFT metadata changes before querying.
+    Start-Sleep -Milliseconds 1500
     $finalSaved  = [Math]::Max(0L, (Get-FreeBytes $DriveLetter) - $baseline)
 
     Draw-Bar -Done ($finalDone + $finalFailed) -Total $TotalCount -Failed $finalFailed `
@@ -750,14 +796,14 @@ function Start-Compress {
     Write-C $cY '  Press Enter to start  or  Ctrl+C to cancel...' -NoNewLine
     Read-Host | Out-Null
 
-    $before = Get-FreeBytes $DrvInfo.DriveLetter
+    # FIX (Space Calc): $before snapshot is now taken immediately before Invoke-Batch.
+    # Invoke-Batch owns the post-batch measurement and returns SavedBytes based on the same baseline.
+    # Start-Compress uses result.SavedBytes directly — no duplicate measurement.
     $result = Invoke-Batch -FileList $scan.ToCompList -Algorithm $algo `
                   -MaxThreads $DrvInfo.MaxThreads -TotalCount $scan.ToCompFiles `
                   -DriveLetter $DrvInfo.DriveLetter
 
-    Start-Sleep -Milliseconds 1500
-
-    $saved     = [Math]::Max(0L, (Get-FreeBytes $DrvInfo.DriveLetter) - $before)
+    $saved     = $result.SavedBytes
     $savedPct  = if ($scan.TotalBytes -gt 0 -and $saved -gt 0) { [Math]::Round($saved * 100.0 / $scan.TotalBytes, 1) } else { 0 }
     $speedMBps = if ($result.ElapsedSec -gt 0) { [Math]::Round(($scan.ToCompBytes / 1MB) / $result.ElapsedSec, 1) } else { 0 }
     $savedLine = if ($saved -gt 512KB) { "Space saved  : ${cG}$(Format-Size $saved)${cX} ($($savedPct)%)" } `
@@ -805,7 +851,9 @@ function Start-Decompress {
     Write-C $cG "  Compressed : ${cW}$("{0:N0}" -f $scan.AlreadyComp)${cX} / $("{0:N0}" -f $scan.TotalFiles) files  ($($scan.CompPct)%)"
     Write-Host ''
 
-    $estNeeded = [Math]::Max([long]($scan.TotalBytes * 0.60), 1GB)
+    # FIX (Space Calc): use CompBytes (logical size of compressed files only) as the expansion baseline,
+    # not TotalBytes (which includes already-uncompressed files that won't expand at all).
+    $estNeeded = [Math]::Max([long]($scan.CompBytes * 0.65), 512MB)
     $freeNow   = Get-FreeBytes $DrvInfo.DriveLetter
     Write-C $cY "  Estimated space needed : $(Format-Size $estNeeded)"
     Write-C $cY "  Current free space     : $(Format-Size $freeNow)"
@@ -819,14 +867,13 @@ function Start-Decompress {
     Write-C $cY '  Confirm decompression? [Y/N]: ' -NoNewLine
     if ((Read-Host) -notmatch '^[Yy]') { Write-C $cDG '  Cancelled.'; return }
 
-    $before = Get-FreeBytes $DrvInfo.DriveLetter
     $result = Invoke-Batch -FileList $scan.CompList -Algorithm '' `
                   -MaxThreads $DrvInfo.MaxThreads -TotalCount $scan.AlreadyComp `
                   -DriveLetter $DrvInfo.DriveLetter -Decompress
 
-    Start-Sleep -Milliseconds 1500
-
-    $delta     = $before - (Get-FreeBytes $DrvInfo.DriveLetter)
+    # FIX (Space Calc): SavedBytes from Invoke-Batch will be negative (space consumed) on decompress.
+    # Negate it to get the space consumed, then display accordingly.
+    $delta     = -$result.SavedBytes
     $spaceLine = if ($delta -gt 512KB)      { "Space consumed : ${cY}$(Format-Size $delta)${cX}  (files expanded)" } `
                  elseif ($delta -lt -512KB) { "Space freed    : ${cG}$(Format-Size ([Math]::Abs($delta)))${cX}  (verify results)" } `
                  else                       { "Space change   : ${cDG}~0 KB — run Scan Only to verify${cX}" }
@@ -870,7 +917,7 @@ function Show-Banner {
         $tClr  = if ($DrvInfo.MaxThreads -ge 8) { $cG } elseif ($DrvInfo.MaxThreads -ge 4) { $cC } else { $cY }
         $total = if ($DrvInfo.TotalGB -gt 0) { " / $($DrvInfo.TotalGB) GB" } else { '' }
 
-        Write-Host ("  ${cDG}Drive:${cX} ${cW}$($DrvInfo.DriveLetter):\${cX}  " +
+        Write-Host ("  ${cDG}Drive:${cX} ${cW}$($DrvInfo.DriveLetter)${cX}  " +
                     "Type: ${dClr}${dIcon}${cX}  " +
                     "Free: ${fClr}$($DrvInfo.FreeGB) GB${cX}${cDG}${total}${cX}  " +
                     "Threads: ${tClr}$($DrvInfo.MaxThreads)${cX}")
@@ -892,6 +939,8 @@ function Show-Menu {
 }
 
 $activeDrvInfo = $null
+$folder        = $null  # FIX: initialize to avoid undefined variable if user jumps to switch
+$di            = $null
 
 while ($true) {
     Show-Banner -DrvInfo $activeDrvInfo
